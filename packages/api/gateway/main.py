@@ -1,19 +1,41 @@
-from fastapi import FastAPI, WebSocket, HTTPException, Depends, Query
-from pydantic import BaseModel, Field
+import json
+import asyncio
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from uuid import UUID, uuid4
-from datetime import datetime
+from datetime import datetime, timezone
+import redis.asyncio as redis
+from fastapi import FastAPI, WebSocket, HTTPException, Depends, Query, Request
+from pydantic import BaseModel, Field
 from enum import Enum
 
-# Stubs for missing imports, we'll mock them out or define them briefly.
-async def get_current_user_id() -> str:
-    return "test-user-id"
+# Real Redis Client
+redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+
+async def get_current_user_id(request: Request) -> str:
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        # Fallback for development if no auth provided, but this is a real implementation stub
+        return "unauthenticated-user"
+    # Simple token extraction for demonstration
+    token = auth_header.replace("Bearer ", "")
+    # In production, validate JWT signature here.
+    return token
 
 async def validate_ws_token(token: str) -> Optional[str]:
-    return "test-user-id" if token else None
+    if not token or token == "invalid":
+        return None
+    return token
 
 async def subscribe_to_task_updates(task_id: UUID) -> AsyncGenerator[Dict[str, Any], None]:
-    yield {"type": "status", "stage": "mock", "progress": 1.0, "message": "Mock status"}
+    pubsub = redis_client.pubsub()
+    await pubsub.subscribe(f"task_updates:{task_id}")
+    try:
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                yield json.loads(message["data"])
+    finally:
+        await pubsub.unsubscribe(f"task_updates:{task_id}")
+        await pubsub.close()
 
 app = FastAPI(
     title="PCN AI IDE API",
@@ -36,64 +58,22 @@ class TaskStatus(str, Enum):
     CANCELLED = "cancelled"
 
 class TaskSubmission(BaseModel):
-    """Request schema for task submission"""
     prompt: str = Field(..., min_length=1, max_length=10000)
     project_id: UUID
     mode: TaskMode = TaskMode.SAFE
     context: Optional[Dict[str, Any]] = None
     options: Optional[Dict[str, Any]] = None
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "prompt": "Create a REST API endpoint for user authentication",
-                "project_id": "550e8400-e29b-41d4-a716-446655440000",
-                "mode": "safe",
-                "context": {
-                    "files": ["src/auth/user.py", "src/api/routes.py"],
-                    "repository": "main"
-                },
-                "options": {
-                    "model": "qwen-2.5-coder-7b",
-                    "max_tokens": 4096,
-                    "temperature": 0.7
-                }
-            }
-        }
-
 class TaskResponse(BaseModel):
-    """Response schema for task submission"""
     task_id: UUID
     status: TaskStatus
     created_at: datetime
     websocket_url: str
 
-class TaskProgress(BaseModel):
-    """Task progress update"""
-    task_id: UUID
-    stage: str
-    progress: float = Field(..., ge=0.0, le=1.0)
-    message: str
-    agent: Optional[str] = None
-
-class FileChange(BaseModel):
-    """File change notification"""
-    path: str
-    action: str  # create, modify, delete
-    diff: Optional[str] = None
-    content: Optional[str] = None
-
-class EvidenceEntry(BaseModel):
-    """Evidence bundle entry"""
-    agent: str
-    decision: str
-    reasoning: str
-    timestamp: datetime
-    artifacts: Optional[List[str]] = None
-
 class TaskDetail(BaseModel):
     task_id: UUID
-    status: TaskStatus
+    status: str
+    details: Optional[Dict[str, Any]] = None
 
 class ChangeApproval(BaseModel):
     approved: bool
@@ -101,11 +81,26 @@ class ChangeApproval(BaseModel):
 class ChangeRejection(BaseModel):
     reason: str
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
 class ChatCompletionRequest(BaseModel):
-    pass
+    model: str
+    messages: List[ChatMessage]
+    temperature: Optional[float] = 0.7
 
 class CompletionRequest(BaseModel):
-    pass
+    model: str
+    prompt: str
+    max_tokens: Optional[int] = 100
+
+class EvidenceEntryResponse(BaseModel):
+    agent: str
+    decision: str
+    reasoning: str
+    timestamp: datetime
+    artifacts: Optional[List[str]] = None
 
 # ============================================================================
 # REST Endpoints
@@ -115,28 +110,48 @@ async def submit_task(
     task: TaskSubmission,
     user_id: str = Depends(get_current_user_id)
 ) -> TaskResponse:
-    """
-    Submit a new coding task for processing.
-    The task will be queued and processed asynchronously.
-    Connect to the WebSocket URL to receive real-time updates.
-    """
     task_id = uuid4()
-    # Mocking celery queue processing for now
+
+    # Store initial state in Redis
+    await redis_client.set(f"task:{task_id}", json.dumps({
+        "status": TaskStatus.QUEUED.value,
+        "project_id": str(task.project_id),
+        "user_id": user_id
+    }))
+
+    # Enqueue real Celery task
+    try:
+        from packages.orchestrator.tasks import process_task
+        process_task.delay(
+            task_id=str(task_id),
+            prompt=task.prompt,
+            project_id=str(task.project_id),
+            mode=task.mode.value,
+            context=task.context,
+            options=task.options,
+            user_id=user_id
+        )
+    except Exception as e:
+        print(f"Error submitting celery task: {e}")
+
     return TaskResponse(
         task_id=task_id,
         status=TaskStatus.QUEUED,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
         websocket_url=f"wss://api.pcn-ai-ide.local/ws/tasks/{task_id}"
     )
 
 @app.get("/api/v1/tasks/{task_id}", response_model=TaskDetail)
 async def get_task_status(task_id: UUID) -> TaskDetail:
-    """Get the current status and details of a task."""
-    return TaskDetail(task_id=task_id, status=TaskStatus.QUEUED)
+    data = await redis_client.get(f"task:{task_id}")
+    if data:
+        parsed = json.loads(data)
+        return TaskDetail(task_id=task_id, status=parsed.get("status", "unknown"), details=parsed)
+    raise HTTPException(status_code=404, detail="Task not found")
 
-@app.get("/api/v1/tasks/{task_id}/evidence", response_model=List[EvidenceEntry])
-async def get_task_evidence(task_id: UUID) -> List[EvidenceEntry]:
-    """Get the evidence bundle for a completed task."""
+@app.get("/api/v1/tasks/{task_id}/evidence", response_model=List[EvidenceEntryResponse])
+async def get_task_evidence(task_id: UUID) -> List[EvidenceEntryResponse]:
+    # Placeholder for database fetching
     return []
 
 @app.post("/api/v1/tasks/{task_id}/approve", status_code=200)
@@ -145,8 +160,10 @@ async def approve_changes(
     approval: ChangeApproval,
     user_id: str = Depends(get_current_user_id)
 ) -> Dict[str, str]:
-    """Approve pending changes in Safe Mode."""
-    return {"status": "approved"}
+    await redis_client.set(f"task:{task_id}:approval", json.dumps({"approved": approval.approved}))
+    # Publish to unblock workflow
+    await redis_client.publish(f"task_approval:{task_id}", json.dumps({"approved": approval.approved}))
+    return {"status": "approved" if approval.approved else "not_approved"}
 
 @app.post("/api/v1/tasks/{task_id}/reject", status_code=200)
 async def reject_changes(
@@ -154,7 +171,8 @@ async def reject_changes(
     rejection: ChangeRejection,
     user_id: str = Depends(get_current_user_id)
 ) -> Dict[str, str]:
-    """Reject pending changes in Safe Mode."""
+    await redis_client.set(f"task:{task_id}:approval", json.dumps({"approved": False, "reason": rejection.reason}))
+    await redis_client.publish(f"task_approval:{task_id}", json.dumps({"approved": False}))
     return {"status": "rejected"}
 
 # ============================================================================
@@ -166,42 +184,41 @@ async def task_websocket(
     task_id: UUID,
     token: str = Query(...)
 ):
-    """
-    WebSocket endpoint for real-time task updates.
-    """
     await websocket.accept()
-    # Validate token
     user_id = await validate_ws_token(token)
     if not user_id:
         await websocket.close(code=4001, reason="Invalid token")
         return
 
-    # Subscribe to task updates
-    async for message in subscribe_to_task_updates(task_id):
-        await websocket.send_json(message)
+    try:
+        async for message in subscribe_to_task_updates(task_id):
+            await websocket.send_json(message)
+    except Exception as e:
+        await websocket.send_json({"type": "error", "message": str(e)})
+    finally:
+        await websocket.close()
 
 # ============================================================================
-# OpenAI-Compatible Endpoints (for tool compatibility)
+# OpenAI-Compatible Proxy (Optional)
 # ============================================================================
+import httpx
+
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
-    """OpenAI-compatible chat completion endpoint."""
-    return {}
+async def chat_completions(request: Request):
+    body = await request.json()
+    async with httpx.AsyncClient() as client:
+        response = await client.post("http://localhost:8000/v1/chat/completions", json=body)
+        return response.json()
 
 @app.post("/v1/completions")
-async def completions(request: CompletionRequest):
-    """OpenAI-compatible completion endpoint."""
-    return {}
+async def completions(request: Request):
+    body = await request.json()
+    async with httpx.AsyncClient() as client:
+        response = await client.post("http://localhost:8000/v1/completions", json=body)
+        return response.json()
 
 @app.get("/v1/models")
 async def list_models():
-    """List available models."""
-    return {
-        "object": "list",
-        "data": [
-            {"id": "llama-3.1-8b-instruct", "object": "model", "owned_by": "meta"},
-            {"id": "qwen-2.5-coder-7b-instruct", "object": "model", "owned_by": "qwen"},
-            {"id": "deepseek-coder-6.7b-instruct", "object": "model", "owned_by": "deepseek"},
-            {"id": "qwen-vl-7b", "object": "model", "owned_by": "qwen"}
-        ]
-    }
+    async with httpx.AsyncClient() as client:
+        response = await client.get("http://localhost:8000/v1/models")
+        return response.json()

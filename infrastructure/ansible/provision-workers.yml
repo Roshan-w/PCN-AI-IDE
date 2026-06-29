@@ -1,0 +1,45 @@
+---
+- name: Provision PCN AI IDE Worker Node
+  hosts: workers
+  become: yes
+  vars:
+    nvidia_driver_version: "550"
+    cuda_version: "12.4"
+    python_version: "3.12"
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install NVIDIA driver
+      apt:
+        name: "nvidia-driver-{{ nvidia_driver_version }}"
+        state: present
+
+    - name: Install CUDA toolkit
+      apt:
+        name: "cuda-toolkit-{{ cuda_version }}"
+        state: present
+
+    - name: Install Python {{ python_version }}
+      apt:
+        name:
+          - "python{{ python_version }}"
+          - "python{{ python_version }}-venv"
+          - "python{{ python_version }}-dev"
+        state: present
+
+    - name: Create application user
+      user:
+        name: pcn-ai
+        system: yes
+        shell: /bin/bash
+
+    - name: Create application directory
+      file:
+        path: /opt/pcn-ai-ide
+        state: directory
+        owner: pcn-ai
+        group: pcn-ai
+        mode: '0755'

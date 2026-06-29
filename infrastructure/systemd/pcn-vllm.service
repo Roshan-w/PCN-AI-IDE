@@ -1,0 +1,45 @@
+[Unit]
+Description=PCN AI IDE vLLM Inference Server
+After=network.target nvidia-driver.service
+Wants=nvidia-driver.service
+
+[Service]
+Type=simple
+User=pcn-ai
+Group=pcn-ai
+WorkingDirectory=/opt/pcn-ai-ide/inference-server
+
+# Environment
+Environment="CUDA_VISIBLE_DEVICES=0"
+Environment="MODEL_NAME=qwen-2.5-coder-7b-instruct"
+Environment="VLLM_HOST=0.0.0.0"
+Environment="VLLM_PORT=8000"
+
+# Executable
+ExecStart=/opt/pcn-ai-ide/venv/bin/python -m vllm.entrypoints.openai.api_server \
+    --model /opt/pcn-ai-ide/models/${MODEL_NAME} \
+    --quantization awq \
+    --dtype half \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.9 \
+    --port 8000 \
+    --enable-prefix-caching \
+    --enable-metrics
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Security
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/pcn-ai-ide
+
+[Install]
+WantedBy=multi-user.target
